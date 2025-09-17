@@ -8,7 +8,264 @@ puppeteer.use(StealthPlugin());
 const PORT = process.env.PORT || 3000;
 const HEADLESS = process.env.HEADLESS ?? 'new';
 const PROXY = process.env.PROXY_URL || null;
+const LIGHT = (process.env.LIGHT_MODE || '/* eslint-disable no-console */
+const express = require('express');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const path = require('path');
+puppeteer.use(StealthPlugin());
+
+const PORT = process.env.PORT || 3000;
+const HEADLESS = process.env.HEADLESS ?? 'new';
+const PROXY = process.env.PROXY_URL || null;
 const LIGHT = (process.env.LIGHT_MODE || 'true') === 'true';
+
+// --- dove si trova Chrome scaricato ---
+const REV = process.env.PUPPETEER_BROWSER_REVISION || '127.0.6533.88';
+const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || path.join(__dirname, '.cache/puppeteer');
+const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH
+  || path.join(CACHE_DIR, `chrome/linux-${REV}/chrome-linux64/chrome`);
+
+function slugify(s) {
+  return s.toLowerCase().trim()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, '_');
+}
+
+async function launchBrowser() {
+  const args = ['--no-sandbox', '--disable-setuid-sandbox'];
+  if (PROXY) args.push(`--proxy-server=${PROXY}`);
+  if (LIGHT) args.push('--disable-dev-shm-usage', '--no-zygote', '--single-process');
+
+  return puppeteer.launch({
+    headless: HEADLESS,
+    args,
+    defaultViewport: { width: 1366, height: 900 },
+    executablePath: CHROME_PATH
+  });
+}
+
+async function newPage(browser) {
+  const page = await browser.newPage();
+  if (LIGHT) {
+    await page.setRequestInterception(true);
+    page.on('request', r => {
+      const t = r.resourceType();
+      if (t === 'image' || t === 'media' || t === 'font') r.abort(); else r.continue();
+    });
+  }
+  await page.setDefaultNavigationTimeout(45000);
+  await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+  return page;
+}
+
+async function clickConsent(page) {
+  try {
+    await page.waitForTimeout(400);
+    const btns = await page.$x("//button[contains(., 'Accetta') or contains(., 'Accetto') or contains(., 'Accept') or contains(., 'Consenti')]");
+    if (btns[0]) await btns[0].click();
+  } catch {}
+}
+
+async function gotoResults(page, { q, city = 'milano', region = 'lombardia' }) {
+  const slug = slugify(q);
+  const candidates = [
+    `https://www.paginegialle.it/ricerca/${encodeURIComponent(q)}/${encodeURIComponent(city)}`,
+    `https://www.paginegialle.it/${region}/${city}/${slug}.html`,
+    `https://www.paginegialle.it/ricerca/${encodeURIComponent(q)}`
+  ];
+  for (const url of candidates) {
+    try {
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
+      await clickConsent(page);
+      const ok = await page.$('h1, [class*=risultat], [id*=risultat]');
+      if (ok) return { ok: true, urlTried: url };
+    } catch {}
+  }
+  try {
+    await page.goto('https://www.paginegialle.it', { waitUntil: 'networkidle2', timeout: 45000 });
+    await clickConsent(page);
+    const [what] = await page.$x("//input[@placeholder=\"Inserisci il nome dell’attività\" or @placeholder=\"Inserisci il nome dell'attività\"] | //input[contains(@aria-label,'attività')]");
+    const [where] = await page.$x("//input[@placeholder=\"Inserisci l'indirizzo\"] | //input[contains(@aria-label,'indirizzo') or contains(@aria-label,'dove')]");
+    if (what) { await what.click(); await what.type(q); }
+    if (where) { await where.click(); await where.type(city); }
+    await page.keyboard.press('Enter');
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
+    return { ok: true, urlTried: 'form' };
+  } catch {}
+  return { ok: false };
+}
+
+async function extractSynonyms(page) {
+  return page.evaluate(() => {
+    const bag = new Set();
+    function collectFromBox(box) {
+      if (!box) return;
+      box.querySelectorAll('a, button, span, li').forEach(el => {
+        const t = (el.innerText || '').trim();
+        if (t && t.length < 60 && !/prenota|aperto|chiuso|ordina|distanza|filtri|mappa|recensioni/i.test(t)) bag.add(t);
+      });
+    }
+    document.querySelectorAll('[class*=filter], [class*=filtri], [id*=filter]').forEach(collectFromBox);
+    document.querySelectorAll('h2,h3,h4,strong,[role=heading]').forEach(h => {
+      const tx = (h.textContent || '').toLowerCase();
+      if (/tipi di|categorie correlate|categorie simili|specialit|prodotti|settori/.test(tx))
+        collectFromBox(h.closest('section,div,aside') || h.parentElement);
+    });
+    if (!bag.size) {
+      const body = document.body.innerText || '';
+      const m = body.match(/Tipi di[^\n]*\n([\s\S]{0,600})/i);
+      if (m) m[1].split(/\s{2,}|\n/).map(s => s.trim()).filter(Boolean).forEach(v => bag.add(v));
+    }
+    return Array.from(bag);
+  });
+}
+
+async function extractCount(page) {
+  const text = (await page.$eval('body', el => el.innerText)).toLowerCase();
+  const m1 = text.match(/([\d\.\s]+)\s+risultat/i);
+  if (m1) {
+    const n = parseInt(m1[1].replace(/\./g, '').trim(), 10);
+    if (!Number.isNaN(n)) return n;
+  }
+  const m2 = text.match(/pi[uù]\s+di\s+(\d+)/i);
+  if (m2) return `${m2[1]}+`;
+  if (/nessun risultato|0 risultati/.test(text)) return 0;
+  return null;
+}
+
+// ---------- API ----------
+const app = express();
+app.use(express.json());
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.post('/synonyms', async (req, res) => {
+  let browser;
+  try {
+    const { category, city = 'milano', region = 'lombardia', limit = 12 } = req.body || {};
+    if (!category) return res.status(400).json({ error: 'category is required' });
+
+    browser = await launchBrowser();
+    const page = await newPage(browser);
+    const nav = await gotoResults(page, { q: category, city, region });
+    if (!nav.ok) throw new Error('cannot reach results page');
+
+    await page.waitForTimeout(800);
+    let synonyms = await extractSynonyms(page);
+    synonyms = Array.from(new Set(
+      synonyms.map(s => s.replace(/\s+/g, ' ').trim()).filter(s => s && s.length <= 60)
+    )).slice(0, limit);
+
+    res.json({ category, city, region, count: synonyms.length, synonyms });
+  } catch (e) {
+    console.error('[/synonyms]', e);
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+app.post('/count', async (req, res) => {
+  let browser;
+  try {
+    const { term, city = 'milano', region = 'lombardia' } = req.body || {};
+    if (!term) return res.status(400).json({ error: 'term is required' });
+
+    browser = await launchBrowser();
+    const page = await newPage(browser);
+    const nav = await gotoResults(page, { q: term, city, region });
+    if (!nav.ok) throw new Error('cannot reach results page');
+
+    await page.waitForTimeout(500);
+    const count = await extractCount(page);
+    res.json({ term, city, region, results: count ?? 'unknown' });
+  } catch (e) {
+    console.error('[/count]', e);
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+app.post('/scrape', async (req, res) => {
+  let browser;
+  try {
+    const { category, city = 'milano', region = 'lombardia', withCounts = true, limit = 12 } = req.body || {};
+    if (!category) return res.status(400).json({ error: 'category is required' });
+
+    browser = await launchBrowser();
+    const page = await newPage(browser);
+    const nav = await gotoResults(page, { q: category, city, region });
+    if (!nav.ok) throw new Error('cannot reach results page');
+
+    await page.waitForTimeout(800);
+    let synonyms = await extractSynonyms(page);
+    synonyms = Array.from(new Set(
+      synonyms.map(s => s.replace(/\s+/g, ' ').trim()).filter(s => s && s.length <= 60)
+    )).slice(0, limit);
+
+    if (!withCounts) {
+      return res.json({ category, city, region, items: synonyms.map(s => ({ synonym: s })) });
+    }
+
+    const items = [];
+    for (const s of synonyms) {
+      const nav2 = await gotoResults(page, { q: `${s} ${city}`, city, region });
+      if (!nav2.ok) { items.push({ synonym: s, results: 'unknown' }); continue; }
+      await page.waitForTimeout(350);
+      const n = await extractCount(page);
+      items.push({ synonym: s, results: n ?? 'unknown' });
+    }
+
+    res.json({ category, city, region, items });
+  } catch (e) {
+    console.error('[/scrape]', e);
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+});
+
+if (process.argv[2] === '--cli') {
+  (async () => {
+    const [, , , categoryArg, cityArg = 'milano', regionArg = 'lombardia'] = process.argv;
+    if (!categoryArg) {
+      console.error('Usage: node server.js --cli "<categoria>" [citta] [regione]');
+      process.exit(1);
+    }
+    let browser;
+    try {
+      browser = await launchBrowser();
+      const page = await newPage(browser);
+      const nav = await gotoResults(page, { q: categoryArg, city: cityArg, region: regionArg });
+      if (!nav.ok) throw new Error('cannot reach results page');
+      await page.waitForTimeout(800);
+      let synonyms = await extractSynonyms(page);
+      synonyms = Array.from(new Set(synonyms.map(s => s.replace(/\s+/g, ' ').trim()))).slice(0, 12);
+      const out = [];
+      for (const s of synonyms) {
+        const nav2 = await gotoResults(page, { q: `${s} ${cityArg}`, city: cityArg, region: regionArg });
+        await page.waitForTimeout(300);
+        out.push({ category: categoryArg, synonym: s, results: await extractCount(page) });
+      }
+      console.log(JSON.stringify(out));
+      process.exit(0);
+    } catch (e) {
+      console.error(JSON.stringify({ error: e.message }));
+      process.exit(2);
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+    }
+  })();
+} else {
+  const app = express();
+  app.use(express.json());
+  app.get('/health', (_req, res) => res.json({ ok: true }));
+  // (gli handler sono già registrati sopra)
+  app.listen(PORT, () => console.log(`DEV Scraper API listening on :${PORT} (LIGHT_MODE=${LIGHT})`));
+}') === 'true';
 
 // --- dove si trova Chrome scaricato ---
 const REV = process.env.PUPPETEER_BROWSER_REVISION || '127.0.6533.88';
