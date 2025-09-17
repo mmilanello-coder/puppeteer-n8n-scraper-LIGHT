@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "cli": "node server.js --cli",
-    "postinstall": "PUPPETEER_CACHE_DIR=/opt/render/.cache/puppeteer npx puppeteer browsers install chrome --browser-revision=127.0.6533.88"
+    "postinstall": "PUPPETEER_CACHE_DIR=.cache/puppeteer npx puppeteer browsers install chrome --browser-revision=127.0.6533.88"
   },
   "engines": { "node": ">=18" },
   "dependencies": {
