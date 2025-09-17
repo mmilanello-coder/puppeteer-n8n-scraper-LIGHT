@@ -2,14 +2,13 @@
 const express = require('express');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const { executablePath } = require('puppeteer'); // per puntare al Chrome scaricato
 puppeteer.use(StealthPlugin());
 
 const PORT = process.env.PORT || 3000;
 const HEADLESS = process.env.HEADLESS ?? 'new';
 const PROXY = process.env.PROXY_URL || null;
-
-// ===== Light mode attivo di default nel DEV =====
-const LIGHT = (process.env.LIGHT_MODE || 'true') === 'true';
+const LIGHT = (process.env.LIGHT_MODE || 'true') === 'true'; // default ON in dev
 
 // ---------- helpers ----------
 function slugify(s) {
@@ -23,10 +22,12 @@ async function launchBrowser() {
   const args = ['--no-sandbox', '--disable-setuid-sandbox'];
   if (PROXY) args.push(`--proxy-server=${PROXY}`);
   if (LIGHT) args.push('--disable-dev-shm-usage', '--no-zygote', '--single-process');
+
   return puppeteer.launch({
     headless: HEADLESS,
     args,
-    defaultViewport: { width: 1366, height: 900 }
+    defaultViewport: { width: 1366, height: 900 },
+    executablePath: executablePath() // usa Chrome installato da puppeteer
   });
 }
 
@@ -36,7 +37,6 @@ async function newPage(browser) {
     await page.setRequestInterception(true);
     page.on('request', r => {
       const t = r.resourceType();
-      // blocca asset pesanti, lascia passare HTML/JS/XHR/CSS
       if (t === 'image' || t === 'media' || t === 'font') r.abort(); else r.continue();
     });
   }
@@ -48,9 +48,7 @@ async function newPage(browser) {
 async function clickConsent(page) {
   try {
     await page.waitForTimeout(400);
-    const btns = await page.$x(
-      "//button[contains(., 'Accetta') or contains(., 'Accetto') or contains(., 'Accept') or contains(., 'Consenti')]"
-    );
+    const btns = await page.$x("//button[contains(., 'Accetta') or contains(., 'Accetto') or contains(., 'Accept') or contains(., 'Consenti')]");
     if (btns[0]) await btns[0].click();
   } catch {}
 }
@@ -70,7 +68,6 @@ async function gotoResults(page, { q, city = 'milano', region = 'lombardia' }) {
       if (ok) return { ok: true, urlTried: url };
     } catch {}
   }
-  // fallback: usa la home con form
   try {
     await page.goto('https://www.paginegialle.it', { waitUntil: 'networkidle2', timeout: 45000 });
     await clickConsent(page);
@@ -92,8 +89,7 @@ async function extractSynonyms(page) {
       if (!box) return;
       box.querySelectorAll('a, button, span, li').forEach(el => {
         const t = (el.innerText || '').trim();
-        if (t && t.length < 60 && !/prenota|aperto|chiuso|ordina|distanza|filtri|mappa|recensioni/i.test(t))
-          bag.add(t);
+        if (t && t.length < 60 && !/prenota|aperto|chiuso|ordina|distanza|filtri|mappa|recensioni/i.test(t)) bag.add(t);
       });
     }
     document.querySelectorAll('[class*=filter], [class*=filtri], [id*=filter]').forEach(collectFromBox);
@@ -131,12 +127,14 @@ app.use(express.json());
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/synonyms', async (req, res) => {
-  const { category, city = 'milano', region = 'lombardia', limit = 12 } = req.body || {};
-  if (!category) return res.status(400).json({ error: 'category is required' });
-
-  const browser = await launchBrowser();
+  let browser;
   try {
+    const { category, city = 'milano', region = 'lombardia', limit = 12 } = req.body || {};
+    if (!category) return res.status(400).json({ error: 'category is required' });
+
+    browser = await launchBrowser();
     const page = await newPage(browser);
+
     const nav = await gotoResults(page, { q: category, city, region });
     if (!nav.ok) throw new Error('cannot reach results page');
 
@@ -148,19 +146,22 @@ app.post('/synonyms', async (req, res) => {
 
     res.json({ category, city, region, count: synonyms.length, synonyms });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('[/synonyms]', e);
+    res.status(500).json({ error: String(e.message || e) });
   } finally {
-    await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 });
 
 app.post('/count', async (req, res) => {
-  const { term, city = 'milano', region = 'lombardia' } = req.body || {};
-  if (!term) return res.status(400).json({ error: 'term is required' });
-
-  const browser = await launchBrowser();
+  let browser;
   try {
+    const { term, city = 'milano', region = 'lombardia' } = req.body || {};
+    if (!term) return res.status(400).json({ error: 'term is required' });
+
+    browser = await launchBrowser();
     const page = await newPage(browser);
+
     const nav = await gotoResults(page, { q: term, city, region });
     if (!nav.ok) throw new Error('cannot reach results page');
 
@@ -168,19 +169,22 @@ app.post('/count', async (req, res) => {
     const count = await extractCount(page);
     res.json({ term, city, region, results: count ?? 'unknown' });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('[/count]', e);
+    res.status(500).json({ error: String(e.message || e) });
   } finally {
-    await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 });
 
 app.post('/scrape', async (req, res) => {
-  const { category, city = 'milano', region = 'lombardia', withCounts = true, limit = 12 } = req.body || {};
-  if (!category) return res.status(400).json({ error: 'category is required' });
-
-  const browser = await launchBrowser();
+  let browser;
   try {
+    const { category, city = 'milano', region = 'lombardia', withCounts = true, limit = 12 } = req.body || {};
+    if (!category) return res.status(400).json({ error: 'category is required' });
+
+    browser = await launchBrowser();
     const page = await newPage(browser);
+
     const nav = await gotoResults(page, { q: category, city, region });
     if (!nav.ok) throw new Error('cannot reach results page');
 
@@ -205,9 +209,10 @@ app.post('/scrape', async (req, res) => {
 
     res.json({ category, city, region, items });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('[/scrape]', e);
+    res.status(500).json({ error: String(e.message || e) });
   } finally {
-    await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 });
 
@@ -219,11 +224,14 @@ async function runCli() {
     console.error('Usage: node server.js --cli "<categoria>" [citta] [regione]');
     process.exit(1);
   }
-  const browser = await launchBrowser();
+  let browser;
   try {
+    browser = await launchBrowser();
     const page = await newPage(browser);
+
     const nav = await gotoResults(page, { q: categoryArg, city: cityArg, region: regionArg });
     if (!nav.ok) throw new Error('cannot reach results page');
+
     await page.waitForTimeout(800);
     let synonyms = await extractSynonyms(page);
     synonyms = Array.from(new Set(synonyms.map(s => s.replace(/\s+/g, ' ').trim()))).slice(0, 12);
@@ -240,8 +248,9 @@ async function runCli() {
     console.error(JSON.stringify({ error: e.message }));
     process.exit(2);
   } finally {
-    await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 }
+
 if (process.argv[2] === '--cli') runCli();
 else app.listen(PORT, () => console.log(`DEV Scraper API listening on :${PORT} (LIGHT_MODE=${LIGHT})`));
