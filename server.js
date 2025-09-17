@@ -2,15 +2,20 @@
 const express = require('express');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { executablePath } = require('puppeteer'); // per puntare al Chrome scaricato
+const path = require('path');
 puppeteer.use(StealthPlugin());
 
 const PORT = process.env.PORT || 3000;
 const HEADLESS = process.env.HEADLESS ?? 'new';
 const PROXY = process.env.PROXY_URL || null;
-const LIGHT = (process.env.LIGHT_MODE || 'true') === 'true'; // default ON in dev
+const LIGHT = (process.env.LIGHT_MODE || 'true') === 'true';
 
-// ---------- helpers ----------
+// --- dove si trova Chrome scaricato ---
+const REV = process.env.PUPPETEER_BROWSER_REVISION || '127.0.6533.88';
+const CACHE_DIR = process.env.PUPPETEER_CACHE_DIR || path.join(__dirname, '.cache/puppeteer');
+const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH
+  || path.join(CACHE_DIR, `chrome/linux-${REV}/chrome-linux64/chrome`);
+
 function slugify(s) {
   return s.toLowerCase().trim()
     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
@@ -27,7 +32,7 @@ async function launchBrowser() {
     headless: HEADLESS,
     args,
     defaultViewport: { width: 1366, height: 900 },
-    executablePath: executablePath() // usa Chrome installato da puppeteer
+    executablePath: CHROME_PATH
   });
 }
 
@@ -134,7 +139,6 @@ app.post('/synonyms', async (req, res) => {
 
     browser = await launchBrowser();
     const page = await newPage(browser);
-
     const nav = await gotoResults(page, { q: category, city, region });
     if (!nav.ok) throw new Error('cannot reach results page');
 
@@ -161,96 +165,8 @@ app.post('/count', async (req, res) => {
 
     browser = await launchBrowser();
     const page = await newPage(browser);
-
     const nav = await gotoResults(page, { q: term, city, region });
     if (!nav.ok) throw new Error('cannot reach results page');
 
     await page.waitForTimeout(500);
-    const count = await extractCount(page);
-    res.json({ term, city, region, results: count ?? 'unknown' });
-  } catch (e) {
-    console.error('[/count]', e);
-    res.status(500).json({ error: String(e.message || e) });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-});
-
-app.post('/scrape', async (req, res) => {
-  let browser;
-  try {
-    const { category, city = 'milano', region = 'lombardia', withCounts = true, limit = 12 } = req.body || {};
-    if (!category) return res.status(400).json({ error: 'category is required' });
-
-    browser = await launchBrowser();
-    const page = await newPage(browser);
-
-    const nav = await gotoResults(page, { q: category, city, region });
-    if (!nav.ok) throw new Error('cannot reach results page');
-
-    await page.waitForTimeout(800);
-    let synonyms = await extractSynonyms(page);
-    synonyms = Array.from(new Set(
-      synonyms.map(s => s.replace(/\s+/g, ' ').trim()).filter(s => s && s.length <= 60)
-    )).slice(0, limit);
-
-    if (!withCounts) {
-      return res.json({ category, city, region, items: synonyms.map(s => ({ synonym: s })) });
-    }
-
-    const items = [];
-    for (const s of synonyms) {
-      const nav2 = await gotoResults(page, { q: `${s} ${city}`, city, region });
-      if (!nav2.ok) { items.push({ synonym: s, results: 'unknown' }); continue; }
-      await page.waitForTimeout(350);
-      const n = await extractCount(page);
-      items.push({ synonym: s, results: n ?? 'unknown' });
-    }
-
-    res.json({ category, city, region, items });
-  } catch (e) {
-    console.error('[/scrape]', e);
-    res.status(500).json({ error: String(e.message || e) });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-});
-
-// CLI (per n8n Execute Command, opzionale)
-async function runCli() {
-  const [, , flag, categoryArg, cityArg = 'milano', regionArg = 'lombardia'] = process.argv;
-  if (flag !== '--cli') return;
-  if (!categoryArg) {
-    console.error('Usage: node server.js --cli "<categoria>" [citta] [regione]');
-    process.exit(1);
-  }
-  let browser;
-  try {
-    browser = await launchBrowser();
-    const page = await newPage(browser);
-
-    const nav = await gotoResults(page, { q: categoryArg, city: cityArg, region: regionArg });
-    if (!nav.ok) throw new Error('cannot reach results page');
-
-    await page.waitForTimeout(800);
-    let synonyms = await extractSynonyms(page);
-    synonyms = Array.from(new Set(synonyms.map(s => s.replace(/\s+/g, ' ').trim()))).slice(0, 12);
-
-    const out = [];
-    for (const s of synonyms) {
-      const nav2 = await gotoResults(page, { q: `${s} ${cityArg}`, city: cityArg, region: regionArg });
-      await page.waitForTimeout(300);
-      out.push({ category: categoryArg, synonym: s, results: await extractCount(page) });
-    }
-    console.log(JSON.stringify(out));
-    process.exit(0);
-  } catch (e) {
-    console.error(JSON.stringify({ error: e.message }));
-    process.exit(2);
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-}
-
-if (process.argv[2] === '--cli') runCli();
-else app.listen(PORT, () => console.log(`DEV Scraper API listening on :${PORT} (LIGHT_MODE=${LIGHT})`));
+    const count = await extract
